@@ -1,0 +1,24 @@
+id = "riciolus/notes-todo"
+name = "Notes & To-Do"
+version = "1.0.0"
+plugin_api = 21
+author = "riciolus"
+license = "MIT"
+icon = "notes"
+description = "Notes on the left, to-do list on the right, in a single panel."
+tags = ["panel", "productivity"]
+
+[[widget]]
+id = "main"
+entry = "widget.luau"
+
+  [widget.actions]
+  left = "panel-toggle riciolus/notes-todo:panel"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 880
+height = 760
+placement = "floating"
+position = "top_right"
