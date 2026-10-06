@@ -2,8 +2,10 @@
 -- Notes on the left, to-do list on the right, in one panel.
 --
 -- Notes are .md files in <plugin data>/notes and the tasks live in
--- <plugin data>/todos.json. The note editor autosaves after a short pause in
--- typing, on navigation, and on panel close.
+-- <plugin data>/todos.json. Tasks are one-time or daily; a daily task is done
+-- only while its doneDay matches today, so it resets itself at midnight. The
+-- note editor autosaves after a short pause in typing, on navigation, and on
+-- panel close.
 
 local AUTOSAVE_IDLE_TICKS = 2 -- 1s panel ticks with no edits before a flush
 local SUFFIX = ".md"
@@ -24,14 +26,17 @@ local dirty = false
 local idleTicks = 0
 
 -- Todo state
-local todos = {} -- { { id, title, done } }
+local todos = {} -- { { id, title, type, done?, doneDay? } }
 local nextId = 1
 local showCompleted = true
 local addDraft = ""
+local addType = "once" -- type stamped on the next submitted task
+local currentDay = "" -- local YYYY-MM-DD, watched for the daily reset
 
 -- Shared UI state
 local hoveredNote = nil
 local hoveredTodo = nil
+local hoveredBtn = nil -- key of the hbtn control under the pointer
 local pendingNote = nil -- filename awaiting the second (confirm) click
 local pendingTodo = nil -- task id awaiting the second (confirm) click
 local addRev = 0 -- bumped to reseed the (uncontrolled) add input
@@ -49,10 +54,24 @@ local function displayName(file)
   return file:sub(1, #file - #SUFFIX)
 end
 
+local function today()
+  return noctalia.formatTime("%Y-%m-%d")
+end
+
+-- A one-time task stores `done`. A daily task stores `doneDay` instead and is
+-- only done while that day matches today, so it rolls back to open at midnight
+-- on its own - no write, no drift, same answer after a restart.
+local function isDone(todo)
+  if todo.type == "daily" then
+    return todo.doneDay ~= nil and todo.doneDay == today()
+  end
+  return todo.done == true
+end
+
 local function pendingCount()
   local n = 0
   for _, todo in ipairs(todos) do
-    if not todo.done then
+    if not isDone(todo) then
       n += 1
     end
   end
@@ -70,6 +89,45 @@ local function findIndex(id)
     end
   end
   return nil
+end
+
+-- A bordered stand-in for ui.button: the fill never changes under the pointer,
+-- only the border does (transparent -> accent). The 1px border is laid out even
+-- while idle, so nothing shifts when hover starts.
+local function hbtn(opts)
+  local isHovered = hoveredBtn == opts.key
+  local selected = opts.selected == true
+  local nodes = {}
+  if opts.glyph ~= nil then
+    table.insert(nodes, ui.glyph({
+      name = opts.glyph,
+      size = opts.glyphSize or 15,
+      color = opts.color or "on_surface",
+    }))
+  end
+  if opts.text ~= nil then
+    table.insert(nodes, ui.label({
+      text = opts.text,
+      fontSize = opts.fontSize or 12,
+      color = opts.color or "on_surface",
+    }))
+  end
+  return ui.row({
+    key = opts.key,
+    width = opts.width or (opts.text == nil and 32 or nil),
+    height = opts.height or 32,
+    align = "center",
+    justify = "center",
+    gap = opts.gap or 6,
+    padding = opts.text ~= nil and (opts.padding or 10) or 0,
+    fill = opts.fill,
+    radius = 6 * cornerRadiusScale,
+    borderWidth = 1,
+    border = (isHovered or selected) and (opts.border or "primary") or "#00000000",
+    onClick = opts.onClick,
+    onHover = "onUiHover",
+    tooltip = opts.tooltip,
+  }, nodes)
 end
 
 -- ── notes storage ────────────────────────────────────────────────────────
@@ -180,7 +238,14 @@ local function loadTodos()
   for _, item in ipairs(decoded) do
     if type(item) == "table" and type(item.title) == "string" and item.title ~= "" then
       local id = type(item.id) == "number" and item.id or nextId
-      table.insert(todos, { id = id, title = item.title, done = item.done == true })
+      table.insert(todos, {
+        id = id,
+        title = item.title,
+        -- Anything written before types existed is a one-time task.
+        type = item.type == "daily" and "daily" or "once",
+        done = item.done == true,
+        doneDay = type(item.doneDay) == "string" and item.doneDay or nil,
+      })
       if id >= nextId then
         nextId = id + 1
       end
@@ -189,7 +254,16 @@ local function loadTodos()
 end
 
 local function saveTodos()
-  local ok, err = noctalia.writeFile(todosPath, noctalia.json.encode(todos))
+  -- Write an explicit shape: daily tasks carry doneDay and no done flag.
+  local out = {}
+  for _, todo in ipairs(todos) do
+    if todo.type == "daily" then
+      table.insert(out, { id = todo.id, title = todo.title, type = "daily", doneDay = todo.doneDay })
+    else
+      table.insert(out, { id = todo.id, title = todo.title, type = "once", done = todo.done == true })
+    end
+  end
+  local ok, err = noctalia.writeFile(todosPath, noctalia.json.encode(out))
   if not ok then
     noctalia.notifyError("To-Do", err or "Could not save tasks")
     return
@@ -199,13 +273,21 @@ end
 
 -- ── confirm-delete controls ──────────────────────────────────────────────
 
-local function confirmControls(onConfirm)
+local function confirmControls(prefix, onConfirm)
   return {
     ui.label({ text = "Delete?", color = "error", fontSize = 12 }),
-    ui.button({ glyph = "check", variant = "primary", onClick = onConfirm }),
-    ui.button({
+    hbtn({
+      key = prefix .. "-confirm-yes",
+      glyph = "check",
+      fill = "primary",
+      color = "on_primary",
+      tooltip = "Yes, delete",
+      onClick = onConfirm,
+    }),
+    hbtn({
+      key = prefix .. "-confirm-no",
       glyph = "close",
-      variant = "ghost",
+      tooltip = "Cancel",
       onClick = function()
         pendingNote = nil
         pendingTodo = nil
@@ -227,8 +309,10 @@ local function noteRow(file)
       align = "center",
       padding = 7,
       paddingH = 10,
-      fill = isHovered and "tertiary" or "surface",
+      fill = "surface",
       radius = 6 * cornerRadiusScale,
+      borderWidth = 1,
+      border = isHovered and "primary" or "#00000000",
       onHover = "onNoteHover",
       onClick = function()
         openNote(file)
@@ -238,15 +322,16 @@ local function noteRow(file)
     }),
   }
   if pendingNote == file then
-    for _, node in ipairs(confirmControls(function()
+    for _, node in ipairs(confirmControls("note", function()
       deleteNote(file)
     end)) do
       table.insert(children, node)
     end
   else
-    table.insert(children, ui.button({
+    table.insert(children, hbtn({
+      key = "note-trash-" .. file,
       glyph = "trash",
-      variant = "ghost",
+      tooltip = "Delete note",
       onClick = function()
         pendingNote = file
         render()
@@ -268,8 +353,10 @@ local function notesListView()
         align = "center",
         padding = 7,
         paddingH = 10,
-        fill = scratchHovered and "tertiary" or "surface",
+        fill = "surface",
         radius = 6 * cornerRadiusScale,
+        borderWidth = 1,
+        border = scratchHovered and "primary" or "#00000000",
         onHover = "onNoteHover",
         onClick = "onOpenScratchpad",
       }, {
@@ -297,15 +384,16 @@ end
 local function notesEditorView()
   local trailing = {}
   if pendingNote == current then
-    for _, node in ipairs(confirmControls(function()
+    for _, node in ipairs(confirmControls("editor", function()
       deleteNote(current)
     end)) do
       table.insert(trailing, node)
     end
   else
-    table.insert(trailing, ui.button({
+    table.insert(trailing, hbtn({
+      key = "editor-trash",
       glyph = "trash",
-      variant = "ghost",
+      tooltip = "Delete note",
       onClick = function()
         pendingNote = current
         render()
@@ -313,7 +401,7 @@ local function notesEditorView()
     }))
   end
   local children = {
-    ui.button({ glyph = "arrow-left", variant = "ghost", onClick = "onBack" }),
+    hbtn({ key = "editor-back", glyph = "arrow-left", tooltip = "Back to the list", onClick = "onBack" }),
     ui.input({
       key = "rename-" .. current,
       value = displayName(current),
@@ -348,7 +436,14 @@ local function notesColumn()
   return ui.column({ width = 440, gap = 8, align = "stretch" }, {
     ui.row({ align = "center", gap = 6 }, {
       ui.label({ text = "Notes", fontSize = 14, fontWeight = "bold", flexGrow = 1, color = "on_surface" }),
-      ui.button({ key = "note-new", glyph = "plus", variant = "primary", onClick = "onNewNote" }),
+      hbtn({
+        key = "note-new",
+        glyph = "plus",
+        fill = "primary",
+        color = "on_primary",
+        tooltip = "New note",
+        onClick = "onNewNote",
+      }),
     }),
     isEditor and notesEditorView() or notesListView(),
   })
@@ -359,6 +454,23 @@ end
 local function todoRow(todo)
   local id = todo.id
   local isHovered = hoveredTodo == id
+  local done = isDone(todo)
+  local inner = {
+    ui.glyph({
+      name = done and "square-check" or "square",
+      size = 16,
+      color = done and "primary" or "on_surface_variant",
+    }),
+  }
+  if todo.type == "daily" then
+    table.insert(inner, ui.glyph({ name = "calendar-event", size = 13, color = "primary" }))
+  end
+  table.insert(inner, ui.label({
+    text = todo.title,
+    flexGrow = 1,
+    maxLines = 2,
+    color = done and "on_surface_variant" or "on_surface",
+  }))
   local children = {
     ui.row({
       key = tostring(id),
@@ -367,36 +479,27 @@ local function todoRow(todo)
       align = "center",
       padding = 7,
       paddingH = 10,
-      fill = isHovered and "tertiary" or "surface",
+      fill = "surface",
       radius = 6 * cornerRadiusScale,
+      borderWidth = 1,
+      border = isHovered and "primary" or "#00000000",
       onHover = "onTodoHover",
       onClick = function()
         toggleTodo(id)
       end,
-    }, {
-      ui.glyph({
-        name = todo.done and "square-check" or "square",
-        size = 16,
-        color = todo.done and "primary" or "on_surface_variant",
-      }),
-      ui.label({
-        text = todo.title,
-        flexGrow = 1,
-        maxLines = 2,
-        color = todo.done and "on_surface_variant" or "on_surface",
-      }),
-    }),
+    }, inner),
   }
   if pendingTodo == id then
-    for _, node in ipairs(confirmControls(function()
+    for _, node in ipairs(confirmControls("todo", function()
       deleteTodo(id)
     end)) do
       table.insert(children, node)
     end
   else
-    table.insert(children, ui.button({
+    table.insert(children, hbtn({
+      key = "todo-trash-" .. id,
       glyph = "trash",
-      variant = "ghost",
+      tooltip = "Delete task",
       onClick = function()
         pendingTodo = id
         render()
@@ -410,7 +513,7 @@ local function todoColumn()
   local open = 0
   local done = 0
   for _, todo in ipairs(todos) do
-    if todo.done then
+    if isDone(todo) then
       done += 1
     else
       open += 1
@@ -418,7 +521,7 @@ local function todoColumn()
   end
   local rows = {}
   for _, todo in ipairs(todos) do
-    if showCompleted or not todo.done then
+    if showCompleted or not isDone(todo) then
       table.insert(rows, todoRow(todo))
     end
   end
@@ -428,19 +531,21 @@ local function todoColumn()
   local headerChildren = {
     ui.label({ text = "To-Do", fontSize = 14, fontWeight = "bold", flexGrow = 1, color = "on_surface" }),
     ui.label({ text = open .. " open", fontSize = 11, color = "on_surface_variant" }),
-    ui.button({
+    hbtn({
       key = "todo-show-completed",
       glyph = showCompleted and "eye" or "eye-off",
-      variant = "ghost",
+      tooltip = showCompleted and "Hide completed" or "Show completed",
       onClick = "onToggleCompleted",
     }),
   }
   if done > 0 then
-    table.insert(headerChildren, ui.button({
+    table.insert(headerChildren, hbtn({
       key = "todo-clear",
       text = "Clear done",
-      variant = "ghost",
-      controlSize = "sm",
+      fontSize = 11,
+      padding = 8,
+      height = 30,
+      tooltip = "Remove every completed task",
       onClick = "onClearDone",
     }))
   end
@@ -450,13 +555,53 @@ local function todoColumn()
       ui.input({
         key = "todo-add-" .. addRev,
         value = "",
-        placeholder = "Add a task, press Enter…",
+        placeholder = addType == "daily" and "Add a daily task, press Enter…" or "Add a task, press Enter…",
         flexGrow = 1,
         controlSize = "sm",
         onChange = "onAddChanged",
         onSubmit = "onAddSubmit",
       }),
-      ui.button({ glyph = "plus", variant = "primary", controlSize = "sm", onClick = "onAddSubmit" }),
+      hbtn({
+        key = "type-once",
+        text = "Once",
+        fontSize = 11,
+        padding = 9,
+        height = 32,
+        selected = addType == "once",
+        fill = addType == "once" and "primary/0.2" or nil,
+        color = addType == "once" and "primary" or "on_surface_variant",
+        border = "primary",
+        tooltip = "Finish once, then stay until Clear done",
+        onClick = function()
+          addType = "once"
+          render()
+        end,
+      }),
+      hbtn({
+        key = "type-daily",
+        text = "Daily",
+        fontSize = 11,
+        padding = 9,
+        height = 32,
+        selected = addType == "daily",
+        fill = addType == "daily" and "primary/0.2" or nil,
+        color = addType == "daily" and "primary" or "on_surface_variant",
+        border = "primary",
+        tooltip = "Unchecks itself when the day changes",
+        onClick = function()
+          addType = "daily"
+          render()
+        end,
+      }),
+      hbtn({
+        key = "todo-add",
+        glyph = "plus",
+        fill = "primary",
+        color = "on_primary",
+        height = 32,
+        tooltip = "Add task",
+        onClick = "onAddSubmit",
+      }),
     }),
     ui.scroll({ flexGrow = 1, gap = 4 }, rows),
   })
@@ -468,7 +613,7 @@ render = function()
   panel.render(ui.column({ flexGrow = 1, gap = 12, align = "stretch", padding = 14 }, {
     ui.row({ align = "center", gap = 8 }, {
       ui.label({ text = "Notes & To-Do", fontSize = 16, fontWeight = "bold", flexGrow = 1, color = "on_surface" }),
-      ui.button({ key = "header-close", glyph = "close", variant = "ghost", onClick = "onClosePanel" }),
+      hbtn({ key = "header-close", glyph = "close", tooltip = "Close", onClick = "onClosePanel" }),
     }),
     ui.separator({ thickness = 1, color = "surface_variant" }),
     ui.row({ flexGrow = 1, gap = 14, align = "stretch" }, {
@@ -490,6 +635,7 @@ function onOpen(_context)
   refreshFiles()
   pendingNote = nil
   pendingTodo = nil
+  currentDay = today()
   panel.setWantsSecondTicks(true)
   render()
 end
@@ -499,6 +645,13 @@ function onClose()
 end
 
 function update()
+  -- Daily tasks roll back to open on a date change, even if the panel stays up.
+  local day = today()
+  if day ~= currentDay then
+    currentDay = day
+    publishCount()
+    render()
+  end
   if dirty then
     idleTicks += 1
     if idleTicks >= AUTOSAVE_IDLE_TICKS then
@@ -582,7 +735,17 @@ function toggleTodo(id)
   if index == nil then
     return
   end
-  todos[index].done = not todos[index].done
+  local todo = todos[index]
+  if todo.type == "daily" then
+    -- The date is the switch: stamp today, or clear the stamp.
+    if isDone(todo) then
+      todo.doneDay = nil
+    else
+      todo.doneDay = today()
+    end
+  else
+    todo.done = not todo.done
+  end
   pendingTodo = nil
   saveTodos()
   render()
@@ -604,12 +767,17 @@ function onAddChanged(value)
 end
 
 function onAddSubmit(value)
-  local title = noctalia.string.trim(value ~= nil and value or addDraft)
+  -- A button click may hand us an empty key, so fall back to the draft.
+  local title = noctalia.string.trim((value ~= nil and value ~= "") and value or addDraft)
   if title == "" then
     render()
     return
   end
-  table.insert(todos, { id = nextId, title = title, done = false })
+  local todo = { id = nextId, title = title, type = addType }
+  if addType == "once" then
+    todo.done = false
+  end
+  table.insert(todos, todo)
   nextId += 1
   addDraft = ""
   addRev += 1 -- reseed the input so it starts empty again
@@ -625,7 +793,7 @@ end
 function onClearDone()
   local kept = {}
   for _, todo in ipairs(todos) do
-    if not todo.done then
+    if not isDone(todo) then
       table.insert(kept, todo)
     end
   end
@@ -644,4 +812,9 @@ end
 
 function onClosePanel()
   panel.close()
+end
+
+function onUiHover(state, key)
+  hoveredBtn = (state == "true") and key or nil
+  render()
 end

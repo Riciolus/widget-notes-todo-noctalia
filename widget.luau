@@ -7,6 +7,15 @@ local todosPath = dataDir .. "/todos.json"
 
 local pending = 0
 
+-- Mirrors isDone() in panel.luau: a one-time task stores `done`, a daily task
+-- is done only while its doneDay matches today.
+local function isDone(item)
+  if item.type == "daily" then
+    return item.doneDay ~= nil and item.doneDay == noctalia.formatTime("%Y-%m-%d")
+  end
+  return item.done == true
+end
+
 local function readPending()
   local raw = noctalia.readFile(todosPath)
   if raw == nil or raw == "" then
@@ -18,7 +27,7 @@ local function readPending()
   end
   local count = 0
   for _, item in ipairs(decoded) do
-    if type(item) == "table" and item.done ~= true then
+    if type(item) == "table" and not isDone(item) then
       count += 1
     end
   end

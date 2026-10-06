@@ -1,7 +1,7 @@
 id = "riciolus/notes-todo"
 name = "Notes & To-Do"
-version = "1.0.0"
-plugin_api = 21
+version = "1.1.0"
+plugin_api = 32
 author = "riciolus"
 license = "MIT"
 icon = "notes"
