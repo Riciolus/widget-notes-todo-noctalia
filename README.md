@@ -37,7 +37,15 @@ Everything lives in the plugin's persistent data directory:
 Local drop-in, hot-reloads on `.luau` edits:
 
 ```sh
-~/.local/share/noctalia/plugins/riciolus/notes-todo/
-noctalia plugins lint ~/.local/share/noctalia/plugins/riciolus/notes-todo
+~/.local/share/noctalia/plugins/notes-todo/
+noctalia plugins lint ~/.local/share/noctalia/plugins/notes-todo
 noctalia msg plugins enable riciolus/notes-todo
 ```
+
+## Credits
+
+This plugin was written with AI assistance — designed, implemented, linted and
+debugged by [opencode](https://opencode.ai) running the `big-pickle` model
+(`opencode/big-pickle`). The human provided the requirements, made the UX calls
+(notes left / to-dos right, top-right placement, panel geometry) and verified
+the result on screen.
