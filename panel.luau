@@ -610,7 +610,7 @@ end
 -- ── root ─────────────────────────────────────────────────────────────────
 
 render = function()
-  panel.render(ui.column({ flexGrow = 1, gap = 12, align = "stretch", padding = 14 }, {
+  panel.render(ui.column({ flexGrow = 1, gap = 12, align = "stretch", padding = 0 }, {
     ui.row({ align = "center", gap = 8 }, {
       ui.label({ text = "Notes & To-Do", fontSize = 16, fontWeight = "bold", flexGrow = 1, color = "on_surface" }),
       hbtn({ key = "header-close", glyph = "close", tooltip = "Close", onClick = "onClosePanel" }),
