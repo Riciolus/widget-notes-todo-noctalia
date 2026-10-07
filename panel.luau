@@ -47,6 +47,7 @@ local dueDraft = ""
 local dueRev = 0
 local lastDeleted = nil -- { todo, index } backing the undo strip
 local undoTicks = 0 -- seconds left before the undo strip disappears
+local panelOpen = false -- IPC writes must know whether `todos` is live or stale
 
 -- Shared UI state
 local hoveredNote = nil
@@ -1069,12 +1070,14 @@ function onOpen(_context)
   lastDeleted = nil
   undoTicks = 0
   currentDay = today()
+  panelOpen = true
   panel.setWantsSecondTicks(true)
   render()
 end
 
 function onClose()
   flush()
+  panelOpen = false
 end
 
 function update()
@@ -1475,4 +1478,44 @@ end
 function onUiHover(state, key)
   hoveredBtn = (state == "true") and key or nil
   render()
+end
+
+-- ── shell IPC ────────────────────────────────────────────────────────────
+-- noctalia msg plugin riciolus/notes-todo:panel all <event> [payload]
+--
+-- `add` and `add-daily` insert a task from outside the panel (opencode, a
+-- script, a keybind). While the panel is closed the in-memory list only
+-- reflects its last open, so the handler re-reads todos.json first - an
+-- external add must never resurrect old tasks or drop new ones. While the
+-- panel is open the list is live, so the row is inserted and rendered in
+-- place without touching pending note edits.
+--
+-- `reload` re-reads todos.json and the notes directory while the panel is
+-- open, for writers that fall back to editing those files directly. Nothing
+-- to do when it is closed: onOpen() reads everything anyway.
+function onIpc(event, payload)
+  if event == "add" or event == "add-daily" then
+    local title = noctalia.string.trim(payload or "")
+    if title == "" then
+      return
+    end
+    if not panelOpen then
+      loadTodos()
+    end
+    local todo = { id = nextId, title = title, type = event == "add-daily" and "daily" or "once" }
+    if todo.type == "once" then
+      todo.done = false
+    end
+    nextId += 1
+    table.insert(todos, todo)
+    saveTodos()
+    if panelOpen then
+      render()
+    end
+  elseif event == "reload" and panelOpen then
+    loadTodos()
+    refreshFiles()
+    publishStats()
+    render()
+  end
 end

@@ -6,7 +6,7 @@ One panel, two columns: **notes on the left**, **to-do list on the right**.
 | --- | --- |
 | ID | `riciolus/notes-todo` |
 | Entries | Bar widget: `main`; panel: `panel`; service: `reminders` |
-| Version | `1.3.0` |
+| Version | `1.4.0` |
 
 ## Usage
 
@@ -59,6 +59,22 @@ list; the order is saved to `todos.json`.
 **Bar widget** — shows the completion rail and `open/total` on a horizontal
 bar (stacked glyph + ratio on a vertical bar), and lists the first five open
 task titles on hover.
+
+**Shell IPC** — other tools (opencode, scripts, keybinds) can drive the panel:
+
+```sh
+noctalia msg plugin riciolus/notes-todo:panel all add "buy milk"   # one-time
+noctalia msg plugin riciolus/notes-todo:panel all add-daily "gym"  # daily
+noctalia msg plugin riciolus/notes-todo:panel all reload           # re-read file state
+```
+
+The panel entry stays loaded while the panel is closed, so `add` re-reads
+`todos.json` before appending — an external insert never resurrects stale
+tasks or drops fresh ones. While the panel is open the row is inserted and
+rendered in place. `reload` picks up direct writes to `todos.json` or
+`notes/*.md` while the panel is open. A thin wrapper around all of this lives
+at `~/.local/bin/noctalia-todo` (`add [--daily]`, `note`, `list`), with an
+atomic file fallback for when the shell is unreachable.
 
 **Reminders** — the `reminders` service runs in the background and fires a
 desktop notification when a task comes due, at most once per due slot and
