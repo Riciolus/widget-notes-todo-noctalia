@@ -26,17 +26,29 @@ local function readStats()
   if type(decoded) ~= "table" then
     return { open = 0, total = 0, titles = {} }
   end
-  local open = 0
-  local titles = {}
-  for _, item in ipairs(decoded) do
-    if type(item) == "table" and not isDone(item) then
-      open += 1
-      if #titles < MAX_TITLES then
-        table.insert(titles, type(item.title) == "string" and item.title or "?")
+  -- v2 stores { version, groups, tasks }; v1 was a bare task array.
+  local list = type(decoded.tasks) == "table" and decoded.tasks or decoded
+  local groupNames = {}
+  if type(decoded.groups) == "table" then
+    for _, group in ipairs(decoded.groups) do
+      if type(group) == "table" and type(group.id) == "number" and type(group.title) == "string" then
+        groupNames[group.id] = group.title
       end
     end
   end
-  return { open = open, total = #decoded, titles = titles }
+  local open = 0
+  local titles = {}
+  for _, item in ipairs(list) do
+    if type(item) == "table" and not isDone(item) then
+      open += 1
+      if #titles < MAX_TITLES then
+        local title = type(item.title) == "string" and item.title or "?"
+        local name = type(item.group) == "number" and groupNames[item.group] or nil
+        table.insert(titles, name ~= nil and (name .. " · " .. title) or title)
+      end
+    end
+  end
+  return { open = open, total = #list, titles = titles }
 end
 
 -- The tooltip is the task list: how many are open, then the first few titles.

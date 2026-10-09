@@ -11,7 +11,9 @@ local AUTOSAVE_IDLE_TICKS = 2 -- 1s panel ticks with no edits before a flush
 local UNDO_TICKS = 6 -- seconds the "task deleted - Undo" strip stays up
 local SUFFIX = ".md"
 local DRAG_TYPE = "todo" -- dragType shared by every todo grip and insertion zone
+local GROUP_DRAG_TYPE = "group" -- dragType of the project-header grips
 local SCRATCH = "scratch" .. SUFFIX
+local UNGROUPED = 0 -- scope key for tasks that belong to no project
 
 local dataDir = noctalia.pluginDataDir()
 local notesDir = dataDir .. "/notes"
@@ -33,11 +35,17 @@ local previewMode = false -- rendering the note with ui.markdown instead of edit
 local pins = {} -- set of filenames sorted ahead of everything else
 
 -- Todo state
-local todos = {} -- { { id, title, type, done?, doneDay?, due? } }
-local nextId = 1
+local todos = {} -- { { id, title, type, done?, doneDay?, due?, group? } }
+local groups = {} -- ordered projects: { { id, title, collapsed } }
+local nextId = 1 -- shared by tasks and projects, so every id is unique
 local showCompleted = true
-local addDraft = ""
+local addDrafts = {} -- scope ("0" or a group id) -> text typed in that add row
+local addRevs = {} -- scope -> bumped to reseed the (uncontrolled) add input
 local addType = "once" -- type stamped on the next submitted task
+local editingGroup = nil -- project id whose name is being edited in place
+local groupDraft = ""
+local groupRev = 0 -- bumped to reseed the (uncontrolled) name input
+local pendingGroup = nil -- project id awaiting the second (confirm) click
 local currentDay = "" -- local YYYY-MM-DD, watched for the daily reset
 local editingTodo = nil -- task id whose title is being edited in place
 local editDraft = ""
@@ -55,7 +63,6 @@ local hoveredTodo = nil
 local hoveredBtn = nil -- key of the hbtn control under the pointer
 local pendingNote = nil -- filename awaiting the second (confirm) click
 local pendingTodo = nil -- task id awaiting the second (confirm) click
-local addRev = 0 -- bumped to reseed the (uncontrolled) add input
 local cornerRadiusScale = 1.0
 
 local render
@@ -328,10 +335,17 @@ local function deleteNote(file)
 end
 
 -- ── todo storage ─────────────────────────────────────────────────────────
+--
+-- The file is one object: { version = 2, groups = [...], tasks = [...] }.
+-- Files written before projects existed were a bare task array; the loader
+-- still reads that shape, so an upgrade never loses a task.
 
 local function loadTodos()
   todos = {}
+  groups = {}
   nextId = 1
+  addDrafts = {}
+  addRevs = {}
   local raw = noctalia.readFile(todosPath)
   if raw == nil or raw == "" then
     return
@@ -340,7 +354,33 @@ local function loadTodos()
   if type(decoded) ~= "table" then
     return
   end
-  for _, item in ipairs(decoded) do
+
+  local rawTasks = decoded
+  if type(decoded.tasks) == "table" then
+    rawTasks = decoded.tasks
+    if type(decoded.groups) == "table" then
+      for _, item in ipairs(decoded.groups) do
+        if type(item) == "table" and type(item.title) == "string" and item.title ~= "" then
+          local gid = type(item.id) == "number" and item.id or nextId
+          table.insert(groups, {
+            id = gid,
+            title = item.title,
+            collapsed = item.collapsed == true,
+          })
+          if gid >= nextId then
+            nextId = gid + 1
+          end
+        end
+      end
+    end
+  end
+
+  local known = {}
+  for _, group in ipairs(groups) do
+    known[group.id] = true
+  end
+
+  for _, item in ipairs(rawTasks) do
     if type(item) == "table" and type(item.title) == "string" and item.title ~= "" then
       local id = type(item.id) == "number" and item.id or nextId
       local kind = item.type == "daily" and "daily" or "once"
@@ -353,6 +393,12 @@ local function loadTodos()
           due = item.due
         end
       end
+      -- A task pointing at a project that is gone degrades to ungrouped
+      -- rather than disappearing.
+      local group = nil
+      if type(item.group) == "number" and known[item.group] then
+        group = item.group
+      end
       table.insert(todos, {
         id = id,
         title = item.title,
@@ -361,6 +407,7 @@ local function loadTodos()
         done = item.done == true,
         doneDay = type(item.doneDay) == "string" and item.doneDay or nil,
         due = due,
+        group = group,
       })
       if id >= nextId then
         nextId = id + 1
@@ -371,9 +418,9 @@ end
 
 local function saveTodos()
   -- Write an explicit shape: daily tasks carry doneDay and no done flag.
-  local out = {}
+  local outTasks = {}
   for _, todo in ipairs(todos) do
-    local row = { id = todo.id, title = todo.title, due = todo.due }
+    local row = { id = todo.id, title = todo.title, due = todo.due, group = todo.group }
     if todo.type == "daily" then
       row.type = "daily"
       row.doneDay = todo.doneDay
@@ -381,14 +428,63 @@ local function saveTodos()
       row.type = "once"
       row.done = todo.done == true
     end
-    table.insert(out, row)
+    table.insert(outTasks, row)
   end
-  local ok, err = noctalia.writeFile(todosPath, noctalia.json.encode(out))
+  local outGroups = {}
+  for _, group in ipairs(groups) do
+    table.insert(outGroups, { id = group.id, title = group.title, collapsed = group.collapsed == true })
+  end
+  local ok, err = noctalia.writeFile(todosPath, noctalia.json.encode({
+    version = 2,
+    groups = outGroups,
+    tasks = outTasks,
+  }))
   if not ok then
     noctalia.notifyError("To-Do", err or "Could not save tasks")
     return
   end
   publishStats()
+end
+
+-- ── group helpers ────────────────────────────────────────────────────────
+
+local function findGroupIndex(gid)
+  for index, group in ipairs(groups) do
+    if group.id == gid then
+      return index
+    end
+  end
+  return nil
+end
+
+local function groupTitle(gid)
+  local index = findGroupIndex(gid)
+  return index ~= nil and groups[index].title or nil
+end
+
+-- The project's tasks, in list order. Rendering filters the flat array rather
+-- than nesting, so a task's position inside its project is its array order.
+local function tasksInGroup(gid)
+  local out = {}
+  for _, todo in ipairs(todos) do
+    if (todo.group or UNGROUPED) == gid then
+      table.insert(out, todo)
+    end
+  end
+  return out
+end
+
+local function countGroup(gid)
+  local open, total = 0, 0
+  for _, todo in ipairs(todos) do
+    if (todo.group or UNGROUPED) == gid then
+      total += 1
+      if not isDone(todo) then
+        open += 1
+      end
+    end
+  end
+  return open, total
 end
 
 -- ── confirm / edit controls ───────────────────────────────────────────────
@@ -668,27 +764,63 @@ end
 -- panel.openContextMenu may only be called from a ui.button's onRightClick,
 -- so every row carries a ⋯ button: right-click opens the actions menu,
 -- left-click jumps straight into the most common one (rename).
+--
+-- "Move up/down/top/bottom" are scoped to the task's own project: the menu can
+-- only shuffle within a project, and "Move to" changes project (no submenus
+-- exist, so destinations are flattened under a header).
 local function openTodoMenu(id)
   local index = findIndex(id)
   if index == nil then
     return
   end
   local todo = todos[index]
+  local scope = todo.group or UNGROUPED
+  local siblings = tasksInGroup(scope)
+  local position = nil
+  for i, other in ipairs(siblings) do
+    if other.id == id then
+      position = i
+    end
+  end
+
+  local items = {
+    { kind = "header", label = groupTitle(todo.group) or "Ungrouped" },
+    { id = "edit", label = "Edit title" },
+    { id = "due", label = todo.due ~= nil and "Change due time…" or "Set due time…" },
+    { id = "up", label = "Move up", enabled = position ~= nil and position > 1 },
+    { id = "down", label = "Move down", enabled = position ~= nil and position < #siblings },
+    { id = "top", label = "Move to top", enabled = position ~= nil and position > 1 },
+    { id = "bottom", label = "Move to bottom", enabled = position ~= nil and position < #siblings },
+  }
+  -- Destinations: every other project plus Ungrouped. Skipped past 40 projects
+  -- to stay well inside the menu item limit.
+  local moves = {}
+  if #groups <= 40 then
+    for _, group in ipairs(groups) do
+      if group.id ~= todo.group then
+        table.insert(moves, { id = "move:" .. group.id, label = group.title })
+      end
+    end
+    if todo.group ~= nil then
+      table.insert(moves, { id = "move:" .. UNGROUPED, label = "Ungrouped" })
+    end
+  end
+  if #moves > 0 then
+    table.insert(items, { kind = "separator" })
+    table.insert(items, { kind = "header", label = "Move to" })
+    for _, item in ipairs(moves) do
+      table.insert(items, item)
+    end
+  end
+  table.insert(items, { kind = "separator" })
+  table.insert(items, { id = "duplicate", label = "Duplicate" })
+  table.insert(items, { id = "delete", label = "Delete" })
+
   local ok = panel.openContextMenu({
-    items = {
-      { kind = "header", label = "Task" },
-      { id = "edit", label = "Edit title" },
-      { id = "due", label = todo.due ~= nil and "Change due time…" or "Set due time…" },
-      { id = "up", label = "Move up", enabled = index > 1 },
-      { id = "down", label = "Move down", enabled = index < #todos },
-      { id = "top", label = "Move to top", enabled = index > 1 },
-      { id = "bottom", label = "Move to bottom", enabled = index < #todos },
-      { kind = "separator" },
-      { id = "duplicate", label = "Duplicate" },
-      { id = "delete", label = "Delete" },
-    },
+    items = items,
     onActivate = "onTodoMenuAction",
     context = id,
+    maxVisible = 14,
   })
   if not ok then
     noctalia.notifyError("To-Do", "Right-click the ⋯ button to open the actions menu.")
@@ -776,7 +908,7 @@ local function todoRow(todo)
     ui.dragSource({
       key = "todo-grip-" .. id,
       dragType = DRAG_TYPE,
-      payload = tostring(id),
+      payload = "t:" .. id,
       previewAncestor = 1,
       liftFromLayout = true,
       width = 20,
@@ -855,9 +987,9 @@ local function todoRow(todo)
   return ui.row({ key = "todo-" .. id, gap = 6, align = "center" }, children)
 end
 
--- A thin insertion zone between todo rows. Values are id-anchored
--- ("before:<id>" / "after:<id>") so the target stays correct even when
--- completed rows are filtered out of the list.
+-- A thin insertion zone between todo rows. Values are anchored by project and
+-- task id ("g:<gid>:before:<id>" / "g:<gid>:after:<id>" / "g:<gid>:end") so
+-- the target stays correct even when completed rows are filtered out.
 local function todoGap(value)
   return ui.dropZone({
     key = "todo-gap-" .. value,
@@ -871,6 +1003,182 @@ local function todoGap(value)
   })
 end
 
+-- Insertion zones around a project header. They accept another project header
+-- so projects can be reordered by dragging their grip.
+local function groupGap(value)
+  return ui.dropZone({
+    key = "group-gap-" .. value,
+    accepts = { GROUP_DRAG_TYPE },
+    value = value,
+    onDrop = "onReorderGroup",
+    height = 3,
+    radius = 6,
+    expandOnDrag = true,
+    hitSlop = 32,
+  })
+end
+
+-- An empty drop target, so a task can be dragged into a project (or back out
+-- of one) that currently holds nothing.
+local function emptyDropZone(value, text, grow)
+  local props = {
+    key = "todo-empty-" .. value,
+    accepts = { DRAG_TYPE },
+    value = value,
+    onDrop = "onReorderTodo",
+    minHeight = 36,
+    align = "center",
+    justify = "center",
+  }
+  if grow then
+    props.flexGrow = 1
+  end
+  return ui.dropZone(props, {
+    ui.label({ text = text, color = "on_surface_variant", fontSize = 12 }),
+  })
+end
+
+-- The Once/Daily switch. It lives only in the ungrouped add row and sets the
+-- shared default every add row stamps onto the task it submits.
+local function typeToggle(kind)
+  local selected = addType == kind
+  return hbtn({
+    key = "type-" .. kind,
+    text = kind == "daily" and "Daily" or "Once",
+    fontSize = 11,
+    padding = 9,
+    height = 32,
+    selected = selected,
+    fill = selected and "primary/0.2" or nil,
+    color = selected and "primary" or "on_surface_variant",
+    border = "primary",
+    tooltip = kind == "daily" and "Unchecks itself when the day changes" or "Finish once, then stay until Clear done",
+    onClick = function()
+      addType = kind
+      render()
+    end,
+  })
+end
+
+-- The add row for one scope (UNGROUPED or a project id). `scope` keys the
+-- draft/rev state, so every row keeps its own half-typed text.
+local function addRow(scope, placeholder)
+  local rev = addRevs[scope] or 0
+  local children = {
+    ui.input({
+      key = "todo-add-" .. scope .. "-" .. rev,
+      value = "",
+      placeholder = placeholder,
+      flexGrow = 1,
+      controlSize = "sm",
+      onChange = function(value)
+        addDrafts[scope] = value or ""
+      end,
+      onSubmit = function(value)
+        submitAdd(scope, value)
+      end,
+    }),
+  }
+  if scope == UNGROUPED then
+    table.insert(children, typeToggle("once"))
+    table.insert(children, typeToggle("daily"))
+  end
+  table.insert(children, hbtn({
+    key = "todo-addbtn-" .. scope,
+    glyph = "plus",
+    fill = "primary",
+    color = "on_primary",
+    height = 32,
+    tooltip = "Add task",
+    onClick = function()
+      submitAdd(scope)
+    end,
+  }))
+  return ui.row({ key = "todo-addrow-" .. scope, gap = 6, align = "center" }, children)
+end
+
+-- A project's header: drag grip, collapse toggle, name (click to rename) and
+-- its open count, plus delete. The header is a heading, not a task: it never
+-- carries a checkbox.
+local function groupHeaderRow(group)
+  local gid = group.id
+  local open = countGroup(gid)
+  local children = {
+    ui.dragSource({
+      key = "group-grip-" .. gid,
+      dragType = GROUP_DRAG_TYPE,
+      payload = "g:" .. gid,
+      previewAncestor = 1,
+      liftFromLayout = true,
+      width = 20,
+      height = 28,
+      align = "center",
+      justify = "center",
+      tooltip = "Drag to reorder project",
+    }, {
+      ui.glyph({ name = "menu-2", size = 14, color = "on_surface_variant" }),
+    }),
+  }
+  if editingGroup == gid then
+    table.insert(children, ui.input({
+      key = "group-edit-" .. gid .. "-" .. groupRev,
+      value = groupDraft,
+      flexGrow = 1,
+      controlSize = "sm",
+      focus = true,
+      onSubmit = function(value)
+        commitGroupEdit(gid, value)
+      end,
+    }))
+    for _, node in ipairs(confirmControls("group-edit", function()
+      commitGroupEdit(gid)
+    end, { okTooltip = "Save name", onCancel = function()
+      editingGroup = nil
+    end })) do
+      table.insert(children, node)
+    end
+  else
+    table.insert(children, hbtn({
+      key = "group-collapse-" .. gid,
+      glyph = group.collapsed and "chevron-right" or "chevron-down",
+      tooltip = group.collapsed and "Expand project" or "Collapse project",
+      onClick = function()
+        toggleGroupCollapse(gid)
+      end,
+    }))
+    table.insert(children, ui.row({
+      key = "group-name-" .. gid,
+      flexGrow = 1,
+      gap = 8,
+      align = "center",
+      onClick = function()
+        beginGroupEdit(gid)
+      end,
+    }, {
+      ui.label({ text = group.title, flexGrow = 1, maxLines = 1, color = "on_surface", fontWeight = "bold" }),
+      ui.label({ text = open .. " open", fontSize = 10, color = "on_surface_variant" }),
+    }))
+    if pendingGroup == gid then
+      for _, node in ipairs(confirmControls("group", function()
+        deleteGroup(gid)
+      end, { label = "Delete?", okTooltip = "Yes, delete project and its tasks" })) do
+        table.insert(children, node)
+      end
+    else
+      table.insert(children, hbtn({
+        key = "group-trash-" .. gid,
+        glyph = "trash",
+        tooltip = "Delete project",
+        onClick = function()
+          pendingGroup = gid
+          render()
+        end,
+      }))
+    end
+  end
+  return ui.row({ key = "group-" .. gid, gap = 6, align = "center", paddingV = 2 }, children)
+end
+
 local function todoColumn()
   local open = 0
   local done = 0
@@ -882,29 +1190,63 @@ local function todoColumn()
     end
   end
   local rows = {}
-  local lastVisible = nil
-  for _, todo in ipairs(todos) do
-    if showCompleted or not isDone(todo) then
-      table.insert(rows, todoGap("before:" .. todo.id))
-      table.insert(rows, todoRow(todo))
-      lastVisible = todo.id
+  -- Projects first, in their own order. A collapsed project shows only its
+  -- header; an expanded one shows its tasks, an empty drop target and its own
+  -- add row.
+  for _, group in ipairs(groups) do
+    local gid = group.id
+    table.insert(rows, groupGap("group-before:" .. gid))
+    table.insert(rows, groupHeaderRow(group))
+    if not group.collapsed then
+      local lastVisible = nil
+      local shown = 0
+      for _, todo in ipairs(tasksInGroup(gid)) do
+        if showCompleted or not isDone(todo) then
+          table.insert(rows, todoGap("g:" .. gid .. ":before:" .. todo.id))
+          table.insert(rows, todoRow(todo))
+          lastVisible = todo.id
+          shown += 1
+        end
+      end
+      if lastVisible ~= nil then
+        table.insert(rows, todoGap("g:" .. gid .. ":after:" .. lastVisible))
+      end
+      if shown == 0 then
+        table.insert(rows, emptyDropZone("g:" .. gid .. ":end", "Drag a task here or add one below."))
+      end
+      table.insert(rows, addRow(gid, "Add a task to this project…"))
     end
   end
-  if #rows == 0 then
-    -- An empty list stays a valid drop target so a task can be dragged back in.
-    table.insert(rows, ui.dropZone({
-      key = "todo-empty",
-      accepts = { DRAG_TYPE },
-      value = "end",
-      onDrop = "onReorderTodo",
-      flexGrow = 1,
-      align = "center",
-      justify = "center",
-    }, {
-      ui.label({ text = "Nothing here yet - type below and press Enter.", color = "on_surface_variant", fontSize = 12 }),
-    }))
-  else
-    table.insert(rows, todoGap("after:" .. lastVisible))
+  if #groups > 0 then
+    table.insert(rows, groupGap("group-after:" .. groups[#groups].id))
+  end
+
+  -- Ungrouped tasks always come last. The section label only appears once
+  -- projects exist; on a plain list it would just be noise.
+  if #groups > 0 then
+    table.insert(rows, ui.label({ text = "Ungrouped", fontSize = 11, color = "on_surface_variant" }))
+  end
+  local ungrouped = tasksInGroup(UNGROUPED)
+  local lastVisible = nil
+  local shownUngrouped = 0
+  for _, todo in ipairs(ungrouped) do
+    if showCompleted or not isDone(todo) then
+      table.insert(rows, todoGap("g:" .. UNGROUPED .. ":before:" .. todo.id))
+      table.insert(rows, todoRow(todo))
+      lastVisible = todo.id
+      shownUngrouped += 1
+    end
+  end
+  if lastVisible ~= nil then
+    table.insert(rows, todoGap("g:" .. UNGROUPED .. ":after:" .. lastVisible))
+  end
+  if shownUngrouped == 0 then
+    if #groups > 0 then
+      table.insert(rows, emptyDropZone("g:" .. UNGROUPED .. ":end", "Drag a task here to ungroup it."))
+    elseif #ungrouped == 0 then
+      -- A plain empty list stays a valid drop target.
+      table.insert(rows, emptyDropZone("g:" .. UNGROUPED .. ":end", "Nothing here yet - type below and press Enter.", true))
+    end
   end
   local headerChildren = {
     ui.label({ text = "To-Do", fontSize = 14, fontWeight = "bold", flexGrow = 1, color = "on_surface" }),
@@ -912,6 +1254,12 @@ local function todoColumn()
       text = string.format("%d of %d done · %d open", done, open + done, open),
       fontSize = 11,
       color = "on_surface_variant",
+    }),
+    hbtn({
+      key = "todo-new-group",
+      glyph = "folder-plus",
+      tooltip = "New project",
+      onClick = "onNewGroup",
     }),
     hbtn({
       key = "todo-show-completed",
@@ -940,64 +1288,24 @@ local function todoColumn()
       fill = "primary",
       track = "surface_variant",
     }),
-    ui.row({ gap = 6, align = "center" }, {
-      ui.input({
-        key = "todo-add-" .. addRev,
-        value = "",
-        placeholder = addType == "daily" and "Add a daily task, press Enter…" or "Add a task, press Enter…",
-        flexGrow = 1,
-        controlSize = "sm",
-        onChange = "onAddChanged",
-        onSubmit = "onAddSubmit",
-      }),
-      hbtn({
-        key = "type-once",
-        text = "Once",
-        fontSize = 11,
-        padding = 9,
-        height = 32,
-        selected = addType == "once",
-        fill = addType == "once" and "primary/0.2" or nil,
-        color = addType == "once" and "primary" or "on_surface_variant",
-        border = "primary",
-        tooltip = "Finish once, then stay until Clear done",
-        onClick = function()
-          addType = "once"
-          render()
-        end,
-      }),
-      hbtn({
-        key = "type-daily",
-        text = "Daily",
-        fontSize = 11,
-        padding = 9,
-        height = 32,
-        selected = addType == "daily",
-        fill = addType == "daily" and "primary/0.2" or nil,
-        color = addType == "daily" and "primary" or "on_surface_variant",
-        border = "primary",
-        tooltip = "Unchecks itself when the day changes",
-        onClick = function()
-          addType = "daily"
-          render()
-        end,
-      }),
-      hbtn({
-        key = "todo-add",
-        glyph = "plus",
-        fill = "primary",
-        color = "on_primary",
-        height = 32,
-        tooltip = "Add task",
-        onClick = "onAddSubmit",
-      }),
-    }),
     -- gap 1: the 3px insertion zones between rows carry most of the spacing,
     -- so the list keeps roughly its old density while idle.
     ui.scroll({ flexGrow = 1, gap = 1 }, rows),
+    -- The ungrouped add row is pinned below the list so it is always reachable;
+    -- project add rows live inside their sections above.
+    addRow(UNGROUPED, addType == "daily" and "Add a daily task, press Enter…" or "Add a task, press Enter…"),
   }
-  -- Undo strip: the last deleted task stays restorable for a few seconds.
-  if lastDeleted ~= nil and undoTicks > 0 and lastDeleted.todo ~= nil then
+  -- Undo strip: the last delete stays restorable for a few seconds. It covers
+  -- both a single task and a whole project (with all of its tasks).
+  if lastDeleted ~= nil and undoTicks > 0 then
+    local undoText, undoGlyph
+    if lastDeleted.kind == "group" then
+      undoText = 'Deleted project "' .. lastDeleted.group.title .. '"'
+      undoGlyph = "folder-x"
+    else
+      undoText = 'Deleted "' .. lastDeleted.todo.title .. '"'
+      undoGlyph = "trash"
+    end
     table.insert(columnChildren, ui.row({
       key = "todo-undo",
       gap = 8,
@@ -1009,9 +1317,9 @@ local function todoColumn()
       borderWidth = 1,
       border = "primary",
     }, {
-      ui.glyph({ name = "trash", size = 14, color = "primary" }),
+      ui.glyph({ name = undoGlyph, size = 14, color = "primary" }),
       ui.label({
-        text = 'Deleted "' .. lastDeleted.todo.title .. '"',
+        text = undoText,
         flexGrow = 1,
         maxLines = 1,
         fontSize = 11,
@@ -1026,7 +1334,7 @@ local function todoColumn()
         height = 26,
         fill = "primary",
         color = "on_primary",
-        tooltip = "Bring the task back",
+        tooltip = "Bring it back",
         onClick = "onUndoDelete",
       }),
     }))
@@ -1064,7 +1372,9 @@ function onOpen(_context)
   refreshFiles()
   pendingNote = nil
   pendingTodo = nil
+  pendingGroup = nil
   editingTodo = nil
+  editingGroup = nil
   pendingDue = nil
   previewMode = false
   lastDeleted = nil
@@ -1230,7 +1540,7 @@ function deleteTodo(id)
     return
   end
   -- Park the task (and where it lived) so the undo strip can put it back.
-  lastDeleted = { todo = table.remove(todos, index), index = index }
+  lastDeleted = { kind = "todo", todo = table.remove(todos, index), index = index }
   undoTicks = UNDO_TICKS
   pendingTodo = nil
   editingTodo = nil
@@ -1240,24 +1550,31 @@ function deleteTodo(id)
 end
 
 function onUndoDelete()
-  if lastDeleted == nil or lastDeleted.todo == nil then
+  if lastDeleted == nil then
     return
   end
-  local index = math.min(lastDeleted.index or (#todos + 1), #todos + 1)
-  table.insert(todos, index, lastDeleted.todo)
+  if lastDeleted.kind == "group" then
+    local at = math.min(lastDeleted.groupIndex or (#groups + 1), #groups + 1)
+    table.insert(groups, at, lastDeleted.group)
+    for _, todo in ipairs(lastDeleted.tasks or {}) do
+      table.insert(todos, todo)
+    end
+  elseif lastDeleted.todo ~= nil then
+    local index = math.min(lastDeleted.index or (#todos + 1), #todos + 1)
+    table.insert(todos, index, lastDeleted.todo)
+  end
   lastDeleted = nil
   undoTicks = 0
   saveTodos()
   render()
 end
 
-function onAddChanged(value)
-  addDraft = value or ""
-end
-
-function onAddSubmit(value)
+-- scope is UNGROUPED (0) or a project id. A project add row only shows the
+-- input and +; the type comes from the shared default set in the bottom row.
+function submitAdd(scope, value)
   -- A button click may hand us an empty key, so fall back to the draft.
-  local title = noctalia.string.trim((value ~= nil and value ~= "") and value or addDraft)
+  local fallback = addDrafts[scope] or ""
+  local title = noctalia.string.trim((value ~= nil and value ~= "") and value or fallback)
   if title == "" then
     render()
     return
@@ -1266,10 +1583,13 @@ function onAddSubmit(value)
   if addType == "once" then
     todo.done = false
   end
+  if scope ~= UNGROUPED then
+    todo.group = scope
+  end
   table.insert(todos, todo)
   nextId += 1
-  addDraft = ""
-  addRev += 1 -- reseed the input so it starts empty again
+  addDrafts[scope] = ""
+  addRevs[scope] = (addRevs[scope] or 0) + 1 -- reseed the input so it starts empty
   saveTodos()
   render()
 end
@@ -1297,35 +1617,184 @@ function onTodoHover(state, key)
   render()
 end
 
--- Drag-and-drop reorder: the host hands us the dragged id (payload) and the
--- zone's value ("before:<id>", "after:<id>" or "end"). The anchor is resolved
--- after the removal, so dropping next to the row the task came from is a no-op.
+-- Lua patterns have no `|` alternation, so each shape is matched on its own.
+-- Returns gid (number), place ("before" | "after" | "end"), anchor (number|nil).
+local function parseMoveValue(value, currentGid)
+  local gid = currentGid
+  local body = value or ""
+  local prefixed = string.match(body, "^g:(%d+):(.+)$")
+  if prefixed ~= nil then
+    gid = tonumber(prefixed)
+    body = string.match(body, "^g:%d+:(.+)$") or ""
+  end
+  if body == "end" then
+    return gid, "end", nil
+  end
+  local anchor = string.match(body, "^before:(%d+)$")
+  if anchor ~= nil then
+    return gid, "before", tonumber(anchor)
+  end
+  anchor = string.match(body, "^after:(%d+)$")
+  if anchor ~= nil then
+    return gid, "after", tonumber(anchor)
+  end
+  return gid, nil, nil
+end
+
+-- Drag-and-drop move: the host hands us the dragged id (payload "t:<id>") and
+-- the zone's value. Values name the destination project, so a drop can also
+-- change project:
+--   "g:<gid>:before:<id>"  "g:<gid>:after:<id>"  "g:<gid>:end"
+-- The legacy "before:<id>" / "after:<id>" / "end" keep the task in its project.
 function onReorderTodo(payload, value)
-  local id = tonumber(payload)
+  local id = tonumber(payload) or tonumber(string.match(payload or "", "^t:(%d+)$"))
   local from = id ~= nil and findIndex(id) or nil
   if from == nil then
     render()
     return
   end
-  local todo = table.remove(todos, from)
-  local place, anchorId = string.match(value, "^(before|after):(%d+)$")
-  if place ~= nil and tonumber(anchorId) == id then
-    -- Dropped beside itself: the task already sits there, leave the list alone.
-    table.insert(todos, from, todo)
+  local todo = todos[from]
+
+  local targetGid, place, anchor = parseMoveValue(value, todo.group or UNGROUPED)
+  if place == nil then
     render()
     return
   end
+  if targetGid ~= UNGROUPED and findGroupIndex(targetGid) == nil then
+    targetGid = UNGROUPED -- the project vanished between drag and drop
+  end
+  if anchor ~= nil and anchor == id then
+    -- Dropped beside itself: the task already sits there, leave the list alone.
+    render()
+    return
+  end
+  table.remove(todos, from)
+  todo.group = targetGid ~= UNGROUPED and targetGid or nil
   local target = #todos + 1
-  if place ~= nil then
-    local anchor = findIndex(tonumber(anchorId))
-    if anchor ~= nil then
-      target = place == "before" and anchor or (anchor + 1)
+  if anchor ~= nil then
+    local anchorIndex = findIndex(anchor)
+    if anchorIndex ~= nil then
+      target = place == "before" and anchorIndex or (anchorIndex + 1)
     end
   end
   table.insert(todos, target, todo)
   pendingTodo = nil
   render() -- model on screen first, then persist
   saveTodos()
+end
+
+-- Project reorder: payload "g:<id>", value "group-before:<id>" / "group-after:<id>".
+function onReorderGroup(payload, value)
+  local id = tonumber(string.match(payload or "", "^g:(%d+)$")) or tonumber(payload)
+  local from = id ~= nil and findGroupIndex(id) or nil
+  if from == nil then
+    render()
+    return
+  end
+  local beforeId = string.match(value or "", "^group%-before:(%d+)$")
+  local afterId = string.match(value or "", "^group%-after:(%d+)$")
+  local place = beforeId ~= nil and "before" or (afterId ~= nil and "after" or nil)
+  local anchor = tonumber(beforeId or afterId)
+  if place == nil or anchor == nil or anchor == id or findGroupIndex(anchor) == nil then
+    render()
+    return
+  end
+  local group = table.remove(groups, from)
+  -- Re-resolve the anchor: removing the dragged header shifted indices.
+  local anchorIndex = findGroupIndex(anchor)
+  local to = place == "before" and anchorIndex or (anchorIndex + 1)
+  table.insert(groups, to, group)
+  saveTodos()
+  render()
+end
+
+-- Project lifecycle. Like the inline editors below, these are globals because
+-- they are referenced from closures built in the UI section above.
+function onNewGroup()
+  local group = { id = nextId, title = "New project", collapsed = false }
+  nextId += 1
+  table.insert(groups, group)
+  saveTodos()
+  beginGroupEdit(group.id)
+end
+
+function beginGroupEdit(gid)
+  if findGroupIndex(gid) == nil then
+    return
+  end
+  editingGroup = gid
+  pendingGroup = nil
+  editingTodo = nil
+  pendingDue = nil
+  pendingTodo = nil
+  groupDraft = groupTitle(gid) or ""
+  groupRev += 1 -- fresh key: the uncontrolled input seeds and takes focus
+  render()
+end
+
+function commitGroupEdit(gid, value)
+  local index = findGroupIndex(gid)
+  if index == nil then
+    editingGroup = nil
+    render()
+    return
+  end
+  local title = noctalia.string.trim((value ~= nil and value ~= "") and value or groupDraft)
+  if title ~= "" then
+    -- Empty text simply cancels: a project must keep a name.
+    groups[index].title = title
+    saveTodos()
+  end
+  editingGroup = nil
+  render()
+end
+
+function toggleGroupCollapse(gid)
+  local index = findGroupIndex(gid)
+  if index == nil then
+    return
+  end
+  groups[index].collapsed = not groups[index].collapsed
+  saveTodos()
+  render()
+end
+
+-- Deleting a project deletes its tasks with it; both go on the undo strip, so
+-- one tap brings the project and all of its tasks back.
+function deleteGroup(gid)
+  local index = findGroupIndex(gid)
+  if index == nil then
+    return
+  end
+  local group = table.remove(groups, index)
+  local removed = {}
+  for i = #todos, 1, -1 do
+    if todos[i].group == gid then
+      table.insert(removed, 1, table.remove(todos, i))
+    end
+  end
+  lastDeleted = { kind = "group", group = group, groupIndex = index, tasks = removed }
+  undoTicks = UNDO_TICKS
+  pendingGroup = nil
+  editingGroup = nil
+  saveTodos()
+  render()
+end
+
+-- Move a task to another project (or to the ungrouped section, gid UNGROUPED).
+function moveTodoToGroup(id, gid)
+  local index = findIndex(id)
+  if index == nil then
+    return
+  end
+  if gid ~= UNGROUPED and findGroupIndex(gid) == nil then
+    return
+  end
+  local todo = table.remove(todos, index)
+  todo.group = gid ~= UNGROUPED and gid or nil
+  table.insert(todos, todo) -- appended, so it lands last in the target project
+  saveTodos()
+  render()
 end
 
 -- ── inline edit / due / menu actions ─────────────────────────────────────
@@ -1342,6 +1811,8 @@ function beginTodoEdit(id)
   editingTodo = id
   pendingDue = nil
   pendingTodo = nil
+  editingGroup = nil
+  pendingGroup = nil
   editDraft = todos[index].title
   editRev += 1 -- fresh key: the uncontrolled input seeds and takes focus
   render()
@@ -1420,30 +1891,60 @@ function onTodoMenuAction(actionId, context)
     duplicateTodo(id)
   elseif actionId == "delete" then
     deleteTodo(id)
+  elseif actionId:sub(1, 5) == "move:" then
+    moveTodoToGroup(id, tonumber(actionId:sub(6)) or UNGROUPED)
   end
 end
 
--- target: -1 / 1 (nudge), "top", or "bottom". Index math happens after the
--- removal, so nudging into the end of the list lands where you expect.
+-- target: -1 / 1 (nudge), "top", or "bottom". Scoped to the task's own
+-- project: the visible order is that project's slice of the flat array, so
+-- moving shuffles the task within its project (or the ungrouped section).
 function moveTodo(id, target)
   local from = findIndex(id)
   if from == nil then
+    return
+  end
+  local todo = todos[from]
+  local siblings = tasksInGroup(todo.group or UNGROUPED)
+  local position = nil
+  for i, other in ipairs(siblings) do
+    if other.id == id then
+      position = i
+    end
+  end
+  if position == nil then
+    render()
     return
   end
   local to
   if target == "top" then
     to = 1
   elseif target == "bottom" then
-    to = #todos
+    to = #siblings
   elseif type(target) == "number" then
-    to = math.max(1, math.min(#todos, from + target))
+    to = math.max(1, math.min(#siblings, position + target))
   end
-  if to == nil or to == from then
+  if to == nil or to == position then
     render()
     return
   end
-  local todo = table.remove(todos, from)
-  table.insert(todos, to, todo)
+  -- Rebuild the project order, then splice the task back into the flat array
+  -- right after its new predecessor (nil = first of the project).
+  local order = {}
+  for i, other in ipairs(siblings) do
+    if i ~= position then
+      table.insert(order, other)
+    end
+  end
+  table.insert(order, to, todo)
+  local anchor = order[to - 1]
+  table.remove(todos, from)
+  if anchor ~= nil then
+    local anchorIndex = findIndex(anchor.id)
+    table.insert(todos, anchorIndex ~= nil and (anchorIndex + 1) or (#todos + 1), todo)
+  else
+    table.insert(todos, 1, todo)
+  end
   saveTodos()
   render()
 end
@@ -1455,13 +1956,16 @@ function duplicateTodo(id)
   end
   local source = todos[index]
   -- A copy starts open even when the original is done; the due time carries
-  -- over since it describes the same work.
+  -- over since it describes the same work, and it stays in the same project.
   local copy = { id = nextId, title = source.title, type = source.type }
   if copy.type == "once" then
     copy.done = false
   end
   if source.due ~= nil then
     copy.due = source.due
+  end
+  if source.group ~= nil then
+    copy.group = source.group
   end
   nextId += 1
   table.insert(todos, index + 1, copy)

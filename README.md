@@ -6,7 +6,7 @@ One panel, two columns: **notes on the left**, **to-do list on the right**.
 | --- | --- |
 | ID | `riciolus/notes-todo` |
 | Entries | Bar widget: `main`; panel: `panel`; service: `reminders` |
-| Version | `1.4.0` |
+| Version | `1.5.0` |
 
 ## Usage
 
@@ -41,24 +41,35 @@ list; the order is saved to `todos.json`.
   date; it flips back to open by itself when the date changes (while the panel
   is open, or the next time anything reads the list), so every day starts
   unchecked.
+- **Projects** — *＋ folder* in the header (or *New project* from a task menu)
+  adds a heading such as *Groceries*. Every project has its **own add row**, so
+  tasks can be typed straight into it, and drag a project by its grip to
+  reorder the headings. A project is a heading, not a task: it has no checkbox,
+  only a collapse chevron, an `n open` count, an inline-rename field (click its
+  name) and a delete button (which removes the project **and its tasks** — both
+  come back with one *Undo*). Tasks in no project sit in an **Ungrouped**
+  section at the bottom.
 - **Task menu** — right-click the `⋯` button on a row (or left-click it to
   jump straight to renaming) for: edit title, set/change a due time, move
-  up / down / to top / to bottom, duplicate, delete. Move up/down/to-top is
-  also the keyboard-accessible alternative to dragging.
+  up / down / to top / to bottom, **move to** another project (or
+  *Ungrouped*), duplicate, delete. Move up/down/to-top is also the
+  keyboard-accessible alternative to dragging, and stays inside the task's own
+  project.
 - **Inline editing** — the title edit and the due-time field each confirm with
   ✓ and cancel with ✕; Escape-side mistakes cost nothing (empty titles are
   ignored rather than wiping the task).
 - **Due times** — a daily task takes `HH:MM`, a one-time task
   `YYYY-MM-DD HH:MM`. The stamp shows next to the title and turns red while
   overdue (and not done).
-- **Undo** — deleting a task leaves a strip at the bottom of the column for
-  six seconds; *Undo* puts it back where it was.
+- **Undo** — deleting a task (or a whole project) leaves a strip at the bottom
+  of the column for six seconds; *Undo* puts it back where it was.
 - **Progress** — the header reads `n of m done · k open` above a completion
-  bar.
+  bar; each project header shows its own open count. Progress is global — a
+  project does not add a second bar.
 
 **Bar widget** — shows the completion rail and `open/total` on a horizontal
 bar (stacked glyph + ratio on a vertical bar), and lists the first five open
-task titles on hover.
+task titles on hover, prefixed with their project (`Groceries · buy milk`).
 
 **Shell IPC** — other tools (opencode, scripts, keybinds) can drive the panel:
 
@@ -89,8 +100,11 @@ Everything lives in the plugin's persistent data directory:
 
 - `notes/*.md` — the notes
 - `pins.json` — pinned note filenames
-- `todos.json` — the task list (`type`: `once` | `daily`; daily completion is
-  the `doneDay` field; `due` holds the optional due time)
+- `todos.json` — the task list as `{ version = 2, groups = [...], tasks = [...] }`;
+  a task has `type` (`once` | `daily`), an optional `due`, and an optional
+  `group` holding its project id. A project is `{ id, title, collapsed }`.
+  Older files held a bare task array and are still read, so upgrading never
+  loses a task — those tasks simply land in *Ungrouped*.
 - `reminders-notified.json` — which due slots the reminder service already
   fired (capped, oldest entries dropped)
 

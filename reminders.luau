@@ -90,6 +90,8 @@ local function scan()
     summary = "task file unreadable"
     return
   end
+  -- v2 stores { version, groups, tasks }; v1 was a bare task array.
+  local list = type(decoded.tasks) == "table" and decoded.tasks or decoded
 
   local today = noctalia.formatTime("%Y-%m-%d")
   local nowMin = minutesOf(noctalia.formatTime("%H:%M"))
@@ -98,7 +100,7 @@ local function scan()
   end
 
   local watched = 0 -- open tasks carrying a due time
-  for _, item in ipairs(decoded) do
+  for _, item in ipairs(list) do
     if type(item) == "table" and type(item.due) == "string" and not isDone(item) then
       watched += 1
       local dueMin, key
